@@ -1,6 +1,8 @@
-## PibiCal
+## PibiCal (Development Branch - Frappe v15)
 
 Frappe App for Events syncronization with CalDav and iCalendar
+
+**⚠️ This is the development branch for Frappe version-15 compatibility. Work in progress to fix NextCloud 31 Calendar authentication issues.**
 
 ## License
 
@@ -10,10 +12,21 @@ MIT
 Requires a Frappe server instance (refer to https://github.com/frappe/frappe), and has dependencies on CalDav (refer to https://github.com/python-caldav/caldav) and icalendar (refer to https://github.com/collective/icalendar).
 
 ## Compatibility
-PibiCal has been tested on Frappe/ERPNext version-12 and version-13 as well join together with NextCloud on server with TLS active and NOT with wildcard certificate.
+- **Stable**: Frappe/ERPNext version-12 and version-13
+- **In Development**: Frappe/ERPNext version-15 (this branch)
+- **Known Issues**: NextCloud 31 Calendar authentication needs fixing
+- **Server Requirements**: TLS active (NOT with wildcard certificate)
 
 ## Installation
-From the frappe-bench folder, execute (change branch to the proper version of Frappe/ERPNext)
+From the frappe-bench folder, execute:
+
+For Frappe v15 (Development):
+```
+$ bench get-app pibical https://github.com/pibico/pibical.git --branch develop
+$ bench install-app pibical
+```
+
+For Frappe v13 (Stable):
 ```
 $ bench get-app pibical https://github.com/pibico/pibical.git --branch version-13
 $ bench install-app pibical

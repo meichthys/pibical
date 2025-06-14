@@ -11,10 +11,59 @@ import sys, requests, hashlib
 from icalendar import Calendar, Event
 from icalendar import vCalAddress, vText, vRecur
 from pytz import UTC, timezone
+import pytz
 
 import caldav
 from frappe.utils.password import get_decrypted_password
-madrid = timezone('Europe/Madrid')
+from frappe.utils import get_datetime, get_datetime_str, strip_html
+
+def get_user_timezone():
+  """Get timezone from user settings or system default"""
+  user_timezone = frappe.db.get_value("User", frappe.session.user, "time_zone")
+  if not user_timezone:
+    # Get system default timezone
+    user_timezone = frappe.get_system_settings("time_zone") or "UTC"
+  return timezone(user_timezone)
+
+def is_event_modified(event1_stamp, event2_stamp):
+  """Compare two event timestamps to check if they differ by more than 1 second"""
+  if isinstance(event1_stamp, str):
+    event1_stamp = datetime.strptime(event1_stamp, '%Y-%m-%d %H:%M:%S')
+  if isinstance(event2_stamp, str):
+    event2_stamp = datetime.strptime(event2_stamp, '%Y-%m-%d %H:%M:%S')
+  
+  # Allow 1 second difference for timezone conversion rounding
+  return abs((event1_stamp - event2_stamp).total_seconds()) > 1
+
+def convert_to_utc(dt, user_tz=None):
+  """Convert datetime to UTC considering user timezone"""
+  if not user_tz:
+    user_tz = get_user_timezone()
+  
+  if isinstance(dt, str):
+    dt = datetime.strptime(dt, '%Y-%m-%d %H:%M:%S')
+  
+  # If datetime is naive, localize it to user timezone first
+  if dt.tzinfo is None:
+    dt = user_tz.localize(dt)
+  
+  # Convert to UTC
+  return dt.astimezone(UTC)
+
+def convert_from_utc(dt, user_tz=None):
+  """Convert UTC datetime to user timezone"""
+  if not user_tz:
+    user_tz = get_user_timezone()
+  
+  if isinstance(dt, str):
+    dt = datetime.strptime(dt, '%Y-%m-%d %H:%M:%S')
+  
+  # If datetime is naive, assume it's UTC
+  if dt.tzinfo is None:
+    dt = UTC.localize(dt)
+  
+  # Convert to user timezone
+  return dt.astimezone(user_tz)
 
 @frappe.whitelist()
 def get_calendar(nuser):
@@ -27,30 +76,42 @@ def get_calendar(nuser):
     # print(caldav_url)
     caldav_username = fp_user.caldav_username
     caldav_token = get_decrypted_password('User', nuser, 'caldav_token', False)
-    # set connection to caldav calendar with user credentials
-    caldav_client = caldav.DAVClient(url=caldav_url, username=caldav_username, password=caldav_token)
-    cal_principal = caldav_client.principal()
-    # fetching calendars from server
-    calendars = cal_principal.calendars()
-    arr_cal = []
-    if calendars:
-      # print("[INFO] Received %i calendars:" % len(calendars))
-      cal_url = caldav_url.replace("principals/users","calendars")
-      for c in calendars:
-        print("Name: %-20s  URL: %s" % (c.name, c.url.replace(cal_url +"/" , "").replace("/","")))
-        scal = {}
-        scal['name'] = c.name
-        scal['url'] = str(c.url)
-        arr_cal.append(scal)
-    else:
-      frappe.msgprint(_("Server has no calendars for your user"))
-    return arr_cal
+    
+    try:
+      # set connection to caldav calendar with user credentials
+      caldav_client = caldav.DAVClient(url=caldav_url, username=caldav_username, password=caldav_token)
+      cal_principal = caldav_client.principal()
+      # fetching calendars from server
+      calendars = cal_principal.calendars()
+      arr_cal = []
+      if calendars:
+        # print("[INFO] Received %i calendars:" % len(calendars))
+        cal_url = caldav_url.replace("principals/users","calendars")
+        for c in calendars:
+          print("Name: %-20s  URL: %s" % (c.name, c.url.replace(cal_url +"/" , "").replace("/","")))
+          scal = {}
+          scal['name'] = c.name
+          scal['url'] = str(c.url)
+          arr_cal.append(scal)
+      else:
+        frappe.msgprint(_("Server has no calendars for your user"))
+      return arr_cal
+    except Exception as e:
+      frappe.log_error(f"CalDAV Error for user {nuser}: {str(e)}", "PibiCal Get Calendar Error")
+      frappe.msgprint(_("Error connecting to CalDAV server: {0}").format(str(e)))
+      return []
+  else:
+    frappe.msgprint(_("Please configure CalDAV settings in your User profile"))
+    return []
 
 @frappe.whitelist()
 def sync_caldav_event_by_user(doc, method=None):
   if doc.sync_with_caldav:
     # Get CalDav Data from logged in user
     fp_user = frappe.get_doc("User", frappe.session.user)
+    # Get user timezone
+    user_tz = get_user_timezone()
+    
     # Continue if CalDav Data exists on logged in user
     if fp_user.caldav_url and fp_user.caldav_username and fp_user.caldav_token:
       # Check if selected calendar matches with previously recorded and delete event if not matching
@@ -60,7 +121,7 @@ def sync_caldav_event_by_user(doc, method=None):
         if '_shared_by_' in ocal:
           pos = ocal.find("_shared_by_")
           ocal = ocal[0:pos]
-        if not ocal in doc.caldav_id_calendar or not 'frappe' in doc.event_uid:
+        if (doc.caldav_id_calendar and not ocal in doc.caldav_id_calendar) or (doc.event_uid and not 'frappe' in doc.event_uid):
           remove_caldav_event(doc)
           doc.caldav_id_url = None
           doc.event_uid = None
@@ -109,30 +170,31 @@ def sync_caldav_event_by_user(doc, method=None):
             event['uid'] = uidstamp
             # SUMMARY from Subject
             event.add('summary', doc.subject)
-            # DTSTAMP from current time
-            doc.event_stamp = datetime.now()
-            event.add('dtstamp', doc.event_stamp)
-            # DTSTART from start
+            # DTSTAMP from current time (always UTC)
+            utc_timestamp = datetime.now(UTC)
+            doc.event_stamp = utc_timestamp.strftime("%Y-%m-%d %H:%M:%S")
+            event.add('dtstamp', utc_timestamp)
+            # DTSTART from start - convert to UTC
             dtstart = datetime.strptime(doc.starts_on, '%Y-%m-%d %H:%M:%S')
             if doc.all_day:
               dtstart = date(dtstart.year, dtstart.month, dtstart.day)
             else:  
-              dtstart = datetime(dtstart.year, dtstart.month, dtstart.day, dtstart.hour, dtstart.minute, dtstart.second, tzinfo=madrid)
+              # Convert to UTC for non-all-day events
+              dtstart = convert_to_utc(dtstart, user_tz)
             event.add('dtstart', dtstart)
-            # DTEND if end
+            # DTEND if end - convert to UTC
             if doc.ends_on:
               dtend = datetime.strptime(doc.ends_on, '%Y-%m-%d %H:%M:%S')
               if doc.all_day:
                 dtend = date(dtend.year, dtend.month, dtend.day)
               else:  
-                dtend = datetime(dtend.year, dtend.month, dtend.day, dtend.hour, dtend.minute, dtend.second, tzinfo=madrid)
+                # Convert to UTC for non-all-day events
+                dtend = convert_to_utc(dtend, user_tz)
               event.add('dtend', dtend)
-            # DESCRIPTION if any
+            # DESCRIPTION if any - convert HTML to plain text
             if doc.description:
-              event.add('description', doc.description)
-            # LOCATION if any
-            if doc.location:
-              event.add('location', doc.location)
+              plain_description = strip_html(doc.description)
+              event.add('description', plain_description)
             # CATEGORIES from event_category
             category = _(doc.event_category)
             event.add('categories', [category])
@@ -142,51 +204,24 @@ def sync_caldav_event_by_user(doc, method=None):
               organizer.params['cn'] = vText(fp_user.caldav_username)
               organizer.params['ROLE'] = vText('ORGANIZER')
               event.add('organizer', organizer)
-            # ATTENDEE if participants
-            """
-            attendee_params = { "CUTYPE"   => "INDIVIDUAL",
-                    "ROLE"     => "REQ-PARTICIPANT",
-                    "PARTSTAT" => "NEEDS-ACTION",
-                    "RSVP"     => "TRUE",
-                    "CN"       => "Firstname Lastname",
-                    "X-NUM-GUESTS" => "0" }
-            """        
+            # STATUS from event status
+            if doc.status:
+              status_map = {
+                'Open': 'TENTATIVE',
+                'Completed': 'CONFIRMED',
+                'Closed': 'CONFIRMED',
+                'Cancelled': 'CANCELLED'
+              }
+              ical_status = status_map.get(doc.status, 'TENTATIVE')
+              event.add('status', ical_status)
+            # ATTENDEES from event_participants
             if doc.event_participants:
-              if len(doc.event_participants) > 0:
-                for _contact in doc.event_participants:
-                  if _contact.reference_doctype in ["Contact", "Customer", "Lead"]:
-                    if _contact.reference_doctype == "Contact":
-                      email = frappe.db.get_value("Contact", _contact.reference_docname, "email_id")
-                    elif _contact.reference_doctype == "Customer":
-                      email = frappe.db.get_value("Customer", _contact.reference_docname, "email_id")
-                    elif _contact.reference_doctype == "Lead":
-                      email = frappe.db.get_value("Lead", _contact.reference_docname, "email_id")
-                    contact = vCalAddress(u'mailto:%s' % email)
-                    contact.params['cn'] = vText(_contact.reference_docname)
-                    contact.params['partstat'] = vText('NEEDS-ACTION')
-                    contact.params['rsvp'] = vText(str(bool(_contact.send_email)).upper())  
-                  elif _contact.reference_doctype == "User":
-                    if not _contact.reference_docname in ["Administrator", "Guest"]:
-                      contact = vCalAddress(u'mailto:%s' % _contact.reference_docname)
-                      contact.params['cn'] = vText(_contact.reference_docname)
-                      contact.params['partstat'] = vText('NEEDS-ACTION')
-                      contact.params['rsvp'] = vText(str(bool(_contact.send_email)).upper())
-                  else:
-                    contact = vCalAddress(u'mailto:%s' % "")
-                    contact.params['cn'] = vText(_contact.reference_docname)
-                  if _contact.participant_type:
-                    if _contact.participant_type == "Chairperson":
-                      contact.params['ROLE'] = vText('CHAIR') 
-                    elif _contact.participant_type == "Required":
-                      contact.params['ROLE'] = vText('REQ-PARTICIPANT') 
-                    elif _contact.participant_type == "Optional":
-                      contact.params['ROLE'] = vText('OPT-PARTICIPANT')
-                    elif _contact.participant_type == "Non Participant":
-                      contact.params['ROLE'] = vText('NON-PARTICIPANT')
-                  else:
-                    contact.params['ROLE'] = vText('REQ-PARTICIPANT')
-                  if contact:
-                    event.add('attendee', contact)
+              for participant in doc.event_participants:
+                if participant.email:
+                  attendee = vCalAddress(u'mailto:%s' % participant.email)
+                  attendee.params['cn'] = vText(participant.reference_docname or participant.email)
+                  attendee.params['ROLE'] = vText('REQ-PARTICIPANT')
+                  event.add('attendee', attendee)
             # Add Recurring events
             if doc.repeat_this_event:
              if doc.repeat_on:
@@ -215,7 +250,7 @@ def sync_caldav_event_by_user(doc, method=None):
                    event.add('rrule', {'freq': [doc.repeat_on.lower()]})
                else:
                  dtuntil = datetime.strptime(doc.repeat_till, '%Y-%m-%d')
-                 dtuntil = datetime(dtuntil.year, dtuntil.month, dtuntil.day, tzinfo=madrid)
+                 dtuntil = convert_to_utc(datetime(dtuntil.year, dtuntil.month, dtuntil.day, 23, 59, 59), user_tz)
                  if doc.repeat_on.lower() == 'weekly':
                    sday = []
                    if doc.monday:
@@ -238,18 +273,37 @@ def sync_caldav_event_by_user(doc, method=None):
                    event.add('rrule', {'freq': [doc.repeat_on.lower()], 'until': [dtuntil]})
             # Add event to iCalendar 
             cal.add_component(event)
-            # Save/Update Frappe Event
-            c.save_event(cal.to_ical())
-            # Get all events in matched calendar just to inform about existing or new event
-            #all_events = c.events()
             
-            #args = {
-            #    "all_events": all_events,
-            #    "caldav_username": caldav_username,
-            #    "caldav_token": caldav_token,
-            #    "uidstamp": uidstamp
-            #}
-            #enqueue(method=check_event_exists, queue='long', timeout=600, now=True, **args)
+            # Check if event already exists on CalDAV server
+            try:
+              existing_event = None
+              all_events = c.events()
+              for cal_event in all_events:
+                cal_url = str(cal_event).replace("Event: https://", "https://" + caldav_username + ":" + caldav_token +"@")
+                req = requests.get(cal_url)
+                ical = Calendar.from_ical(req.text)
+                for evt in ical.walk('vevent'):
+                  evt_uid = evt.decoded('uid')
+                  if isinstance(evt_uid, bytes):
+                    evt_uid = evt_uid.decode('utf-8')
+                  if evt_uid.lower() == uidstamp.lower():
+                    existing_event = cal_event
+                    break
+                if existing_event:
+                  break
+              
+              if existing_event:
+                # Update existing event
+                existing_event.delete()
+                c.save_event(cal.to_ical())
+                frappe.msgprint(_("Event updated on CalDAV server"))
+              else:
+                # Create new event
+                c.save_event(cal.to_ical())
+                frappe.msgprint(_("Event created on CalDAV server"))
+            except Exception as e:
+              frappe.log_error(f"CalDAV sync error: {str(e)}", "PibiCal Sync Error")
+              frappe.msgprint(_("Error syncing event to CalDAV: {0}").format(str(e)))
             
   else:
     if doc.event_uid:
@@ -262,19 +316,6 @@ def sync_caldav_event_by_user(doc, method=None):
       doc.caldav_id_url = None
       doc.event_uid = None
       doc.event_stamp = None
-
-def check_event_exists(all_events, caldav_username, caldav_token, uidstamp):
-  # Loop through events to check if current event exists
-  for url_event in all_events:
-    cal_url = str(url_event).replace("Event: https://", "https://" + caldav_username + ":" + caldav_token + "@")
-    req = requests.get(cal_url)
-    cal = Calendar.from_ical(req.text)
-    for evento in cal.walk('vevent'):
-      if uidstamp in str(evento.decoded('uid')):
-        # print(evento.decoded('summary'), evento.decoded('attendee'), evento.decoded('dtstart'), evento.decoded('dtend'), evento.decoded('dtstamp'))  
-        # Save event in iCalendar to caldav
-        frappe.msgprint(_("Updated/Created Event un Calendar"))
-        return
 
 @frappe.whitelist()
 def remove_caldav_event(doc, method=None):
@@ -318,7 +359,10 @@ def remove_caldav_event(doc, method=None):
               req = requests.get(cal_url)
               cal = Calendar.from_ical(req.text)
               for evento in cal.walk('vevent'):
-                if uidstamp in str(evento.decoded('uid').decode('utf-8').lower()):
+                uid_value = evento.decoded('uid')
+                if isinstance(uid_value, bytes):
+                  uid_value = uid_value.decode('utf-8')
+                if uidstamp in str(uid_value).lower():
                   doExists = True
                   break
               if doExists:
@@ -330,7 +374,7 @@ def sync_outside_caldav():
   # Get All Users with CalDav Credentials
   caldav_users = frappe.get_list(
     doctype = "User",
-    fields = ["name", "caldav_url", "caldav_username"],
+    fields = ["name", "caldav_url", "caldav_username", "time_zone"],
     filters = [['enabled', '=', 1],['name', '!=', 'Administrator'], ['name', '!=', 'Guest'], ['caldav_username', '!=', '']]
   )
   if caldav_users:
@@ -338,6 +382,10 @@ def sync_outside_caldav():
       # Array for include processed uuid events
       sel_uuid = []
       for caldav_user in caldav_users:
+        # Get user timezone
+        user_timezone = caldav_user.time_zone or frappe.get_system_settings("time_zone") or "UTC"
+        user_tz = timezone(user_timezone)
+        
         # Get CalDav URL, CalDav User and Token
         if caldav_user.caldav_url[-1] == "/":
           caldav_url = caldav_user.caldav_url + "users/" + caldav_user.caldav_username
@@ -362,65 +410,83 @@ def sync_outside_caldav():
               # Sync CalDav calendar from OutSide Server
               for evento in cal.walk('vevent'):
                 # Check if already processed uuid event
-                if not evento.decoded('uid').decode("utf-8").lower() in sel_uuid:
+                # Fix double decoding issue
+                event_uid = evento.decoded('uid')
+                if isinstance(event_uid, bytes):
+                    event_uid = event_uid.decode('utf-8')
+                event_uid_lower = str(event_uid).lower()
+                
+                if not event_uid_lower in sel_uuid:
                   # Add uuid event to processed events array
-                  sel_uuid.append(evento.decoded('uid').decode("utf-8").lower())
+                  sel_uuid.append(event_uid_lower)
                   # Processing event if dtstamp has changed or not in frappe events
                   fp_event = frappe.get_list(
                     doctype = 'Event',
                     fields = ['*'],
-                    filters = [['docstatus', '<', 2], ['event_uid', '=', evento.decoded('uid').decode("utf-8").lower()]]
+                    filters = [['docstatus', '<', 2], ['event_uid', '=', event_uid_lower]]
                   )
+                  
+                  # Also check for potential duplicates by subject and time
+                  if not fp_event and 'summary' in evento and 'dtstart' in evento:
+                    summary = evento.decoded('summary')
+                    if isinstance(summary, bytes):
+                      summary = summary.decode('utf-8')
+                    dtstart = evento.decoded('dtstart')
+                    if isinstance(dtstart, datetime):
+                      if dtstart.tzinfo:
+                        dtstart_local = dtstart.astimezone(user_tz)
+                      else:
+                        dtstart_local = UTC.localize(dtstart).astimezone(user_tz)
+                      start_str = dtstart_local.strftime("%Y-%m-%d %H:%M:%S")
+                    else:
+                      start_str = dtstart.strftime("%Y-%m-%d")
+                    
+                    # Check for duplicate by subject and start time
+                    duplicate_check = frappe.get_list(
+                      doctype = 'Event',
+                      fields = ['name', 'event_uid'],
+                      filters = [
+                        ['docstatus', '<', 2],
+                        ['subject', '=', str(summary)],
+                        ['starts_on', '=', start_str],
+                        ['event_uid', '!=', event_uid_lower]
+                      ]
+                    )
+                    
+                    if duplicate_check:
+                      # Skip this event as it appears to be a duplicate
+                      frappe.log_error(f"Skipping potential duplicate event: {summary} at {start_str}", "PibiCal Duplicate Detection")
+                      continue
+                  
                   if fp_event:
-                    # Check if dtstamp has changed meaning it has been updated on NextCloud   
-                    if fp_event[0].event_stamp.strftime("%Y-%m-%d %H:%M:%S") != evento.decoded('dtstamp').astimezone().strftime("%Y-%m-%d %H:%M:%S"):
+                    # Check if dtstamp has changed meaning it has been updated on NextCloud
+                    caldav_stamp = evento.decoded('dtstamp')
+                    if caldav_stamp.tzinfo:
+                      caldav_stamp_local = caldav_stamp.astimezone(user_tz)
+                    else:
+                      caldav_stamp_local = UTC.localize(caldav_stamp).astimezone(user_tz)
+                    
+                    if is_event_modified(fp_event[0].event_stamp, caldav_stamp_local.strftime("%Y-%m-%d %H:%M:%S")):
                       cal_event = frappe.get_doc("Event", fp_event[0].name)
                       # caldav_id_url
                       cal_event.caldav_id_url = str(c.url)
-                      upd_event = prepare_fp_event(cal_event, evento)  
+                      upd_event = prepare_fp_event(cal_event, evento, user_tz)  
                       upd_event.save()
                       #print(upd_event.as_dict())
                   else:
                     #Create new event in Frappe
                     new_cal_event = frappe.new_doc("Event")
                     new_cal_event.caldav_id_url = str(c.url)
-                    new_event = prepare_fp_event(new_cal_event, evento)
+                    new_event = prepare_fp_event(new_cal_event, evento, user_tz)
                     new_event.save()
                     frappe.db.commit()
                     #print(new_event.as_dict())
                     
-def prepare_fp_event(event, cal_event):
+def prepare_fp_event(event, cal_event, user_tz=None):
   # Prepare event for Frappe
-  """
-  VEVENT(
-   {
-    'SUMMARY': vText('b'Modificacion en NC''),
-    'DTSTART': <icalendar.prop.vDDDTypes object at 0xb5ac7210>,
-    'DTSTAMP': <icalendar.prop.vDDDTypes object at 0xb34d7910>,
-    'UID': vText('b'frappe2e1b86d90aefb1d0ff340b382acfa756@pibico.es''),
-    'DESCRIPTION': vText('b'<div>Para ir completando programa\\, y modificando eventos\\, esta vez por PibiCo</div>''),
-    'LOCATION': vText('b'Ubicacion''),
-    'CATEGORIES': <icalendar.prop.vCategory object at 0xb34d7470>,
-    'ATTENDEE': vCalAddress('b'mailto:francisco.alaez@pibico.es''),
-    'ORGANIZER': vCalAddress('b'mailto:pibidesk@gmail.com''),
-    'RRULE': vRecur(
-           {
-		    'FREQ': ['YEARLY'],
-		    'BYMONTH': [9],
-		    'UNTIL': [datetime.datetime(2021, 9, 15, 6, 48, tzinfo=<UTC>)]
-		   }
-          ),
-   'SEQUENCE': 2,
-   'LAST-MODIFIED': <icalendar.prop.vDDDTypes object at 0xb3411110>
-   },
-   VALARM(
-    {
-    'ACTION': vText('b'DISPLAY''),
-    'TRIGGER': <icalendar.prop.vDDDTypes object at 0xb3411130>
-    }
-   )
-  )
-  """
+  if not user_tz:
+    user_tz = get_user_timezone()
+    
   # event_type.  ALWAYS PUBLIC
   event.event_type = "Public"
   # sync_with_caldav. ALWAYS TRUE
@@ -429,77 +495,88 @@ def prepare_fp_event(event, cal_event):
   if not 'summary' in cal_event:
     event.subject = (_("Untitled event"))
   else:
-    event.subject = cal_event.decoded('summary').decode("utf-8")
-  # starts_on
-  if isinstance(cal_event.decoded('dtstart'), datetime):
+    summary = cal_event.decoded('summary')
+    if isinstance(summary, bytes):
+      summary = summary.decode('utf-8')
+    event.subject = str(summary)
+  # starts_on - convert from UTC to user timezone
+  dtstart = cal_event.decoded('dtstart')
+  if isinstance(dtstart, datetime):
     event.all_day = False
-    event.starts_on = cal_event.decoded('dtstart').astimezone().strftime("%Y-%m-%d %H:%M:%S")
+    # If the datetime has timezone info, convert to user timezone
+    if dtstart.tzinfo:
+      dtstart_local = dtstart.astimezone(user_tz)
+    else:
+      # Assume UTC if no timezone info
+      dtstart_local = UTC.localize(dtstart).astimezone(user_tz)
+    event.starts_on = dtstart_local.strftime("%Y-%m-%d %H:%M:%S")
   else:
     event.all_day = True
-    event.starts_on = cal_event.decoded('dtstart').strftime("%Y-%m-%d")
-  # ends_on
+    event.starts_on = dtstart.strftime("%Y-%m-%d")
+  # ends_on - convert from UTC to user timezone
   if 'dtend' in cal_event:
-    if isinstance(cal_event.decoded('dtend'), datetime):
-      event.ends_on = cal_event.decoded('dtend').astimezone().strftime("%Y-%m-%d %H:%M:%S")
+    dtend = cal_event.decoded('dtend')
+    if isinstance(dtend, datetime):
+      # If the datetime has timezone info, convert to user timezone
+      if dtend.tzinfo:
+        dtend_local = dtend.astimezone(user_tz)
+      else:
+        # Assume UTC if no timezone info
+        dtend_local = UTC.localize(dtend).astimezone(user_tz)
+      event.ends_on = dtend_local.strftime("%Y-%m-%d %H:%M:%S")
     else:
-      event.ends_on = cal_event.decoded('dtend').strftime("%Y-%m-%d")
+      event.ends_on = dtend.strftime("%Y-%m-%d")
   # event_dtstamp
-  event.event_stamp = cal_event.decoded('dtstamp').astimezone().strftime("%Y-%m-%d %H:%M:%S")
+  dtstamp = cal_event.decoded('dtstamp')
+  if dtstamp.tzinfo:
+    dtstamp_local = dtstamp.astimezone(user_tz)
+  else:
+    dtstamp_local = UTC.localize(dtstamp).astimezone(user_tz)
+  event.event_stamp = dtstamp_local.strftime("%Y-%m-%d %H:%M:%S")
   # event_uid
-  event.event_uid = cal_event.decoded('uid').decode("utf-8").lower()
+  uid_value = cal_event.decoded('uid')
+  if isinstance(uid_value, bytes):
+    uid_value = uid_value.decode('utf-8')
+  event.event_uid = str(uid_value).lower()
   # description
   if 'description' in cal_event:
-    event.description = cal_event.decoded('description').decode("utf-8")
-  # location
-  if 'location' in cal_event:
-    event.location = cal_event.decoded('location').decode("utf-8")
+    description = cal_event.decoded('description')
+    if isinstance(description, bytes):
+      description = description.decode('utf-8')
+    event.description = str(description)
   # event_category
   if not event.event_category:
     event.event_category = "Other"
-  # event_participants child_table
+  # status
+  if 'status' in cal_event:
+    ical_status = str(cal_event.decoded('status')).upper()
+    status_map = {
+      'TENTATIVE': 'Open',
+      'CONFIRMED': 'Completed',
+      'CANCELLED': 'Cancelled'
+    }
+    event.status = status_map.get(ical_status, 'Open')
+  else:
+    event.status = 'Open'
+  # participants/attendees
+  # Clear existing participants before adding new ones
+  if hasattr(event, 'event_participants') and event.event_participants:
+    event.event_participants = []
   if 'attendee' in cal_event:
-    for attendee in cal_event.get('attendee', []):
-      contact = attendee.replace("mailto:", "")
-      contact_name = frappe.db.get_value("Contact", {"email_id": contact})
-      event_participants = {}
-      if contact_name:
-        isInvited = True
-        if 'event_participants' in event.as_dict():
-          for row in event.event_participants:
-            if contact_name == row.reference_docname or contact == row.reference_docname:
-              isInvited = False
-        if isInvited:
-          event_participants['reference_doctype'] = 'Contact'
-          event_participants['reference_docname'] = contact_name
-          if 'ROLE' in attendee.params:
-            role = attendee.params['role']
-            if role == 'REQ-PARTICIPANT':
-              participant_type = 'Required'
-            elif role == 'CHAIR':
-              participant_type = 'Chairperson'
-            elif role == 'OPT-PARTICIPANT':
-              participant_type = 'Optional'
-            elif role == 'NON-PARTICIPANT':
-              participant_type = 'Non Participant'
-            if participant_type:
-              event_participants['participant_type'] = participant_type  
-          if 'CN' in attendee.params:
-            print(attendee.params['cn'])
-          if 'PARTSTAT' in attendee.params:
-            partstat = attendee.params['partstat']
-            if partstat == 'ACCEPTED':
-              invitation_accepted = True
-              event_participants['invitation_accepted'] = invitation_accepted
-          if 'RSVP' in attendee.params:
-            rsvp = attendee.params['rsvp']
-            if rsvp == 'TRUE':
-              send_email = True
-            else:
-              send_email = False
-            if send_email:
-              event_participants['send_email'] = send_email    
-          
-          event.append('event_participants', event_participants)
+    attendees = cal_event.get('attendee')
+    if not isinstance(attendees, list):
+      attendees = [attendees]
+    for attendee in attendees:
+      email = str(attendee).replace('mailto:', '')
+      if email:
+        # Try to find user by email
+        user_name = frappe.db.get_value("User", {"email": email}, "name")
+        participant = {
+          'email': email,
+          'reference_doctype': 'User' if user_name else None,
+          'reference_docname': user_name if user_name else None
+        }
+        event.append('event_participants', participant)
   # For future development  
   if 'rrule' in cal_event:
     """ {'FREQ': ['WEEKLY'], 'UNTIL': [datetime.datetime(2021, 10, 3, 0, 0)], 'BYDAY': ['TU', 'TH', 'SA']} """
@@ -527,7 +604,78 @@ def prepare_fp_event(event, cal_event):
             if 'SU' in rrule['BYDAY']:
               event.sunday = True 
       if 'UNTIL' in rrule:
-        event.repeat_till = rrule['UNTIL'][0].strftime("%Y-%m-%d")
+        until_dt = rrule['UNTIL'][0]
+        if until_dt.tzinfo:
+          until_local = until_dt.astimezone(user_tz)
+        else:
+          until_local = UTC.localize(until_dt).astimezone(user_tz)
+        event.repeat_till = until_local.strftime("%Y-%m-%d")
                                   
   #print(event.as_dict())
   return event
+
+@frappe.whitelist()
+def send_event_invitations(event_name, recipients):
+  """Send event invitations to selected participants"""
+  import json
+  
+  if isinstance(recipients, str):
+    recipients = json.loads(recipients)
+  
+  event = frappe.get_doc("Event", event_name)
+  
+  # Get user timezone for event details
+  user_tz = get_user_timezone()
+  
+  # Prepare event details for email
+  starts_on = convert_from_utc(datetime.strptime(event.starts_on, '%Y-%m-%d %H:%M:%S'), user_tz) if not event.all_day else event.starts_on
+  ends_on = convert_from_utc(datetime.strptime(event.ends_on, '%Y-%m-%d %H:%M:%S'), user_tz) if event.ends_on and not event.all_day else event.ends_on
+  
+  # Format dates for email
+  if event.all_day:
+    event_time = starts_on if isinstance(starts_on, str) else starts_on.strftime('%Y-%m-%d')
+  else:
+    start_str = starts_on.strftime('%Y-%m-%d %H:%M')
+    end_str = ends_on.strftime('%Y-%m-%d %H:%M') if ends_on else ""
+    event_time = f"{start_str} - {end_str}" if end_str else start_str
+  
+  # Send email to each selected recipient
+  sent_count = 0
+  for recipient in recipients:
+    if recipient.get('send_invitation') and recipient.get('email'):
+      try:
+        # Prepare email content
+        subject = _("Event Invitation: {0}").format(event.subject)
+        
+        # Build message without f-strings for translation functions
+        message = "<h3>" + _("Event Invitation") + "</h3>"
+        message += "<p><strong>" + _("Event") + ":</strong> " + event.subject + "</p>"
+        message += "<p><strong>" + _("Date/Time") + ":</strong> " + event_time + "</p>"
+        
+        if event.description:
+          plain_description = strip_html(event.description)
+          message += "<p><strong>" + _("Description") + ":</strong><br>" + plain_description + "</p>"
+        
+        if event.location:
+          message += "<p><strong>" + _("Location") + ":</strong> " + event.location + "</p>"
+        
+        message += "<hr>"
+        message += "<p><small>" + _("You have been invited to this event. Please mark your calendar.") + "</small></p>"
+        
+        # Send email
+        frappe.sendmail(
+          recipients=[recipient.get('email')],
+          subject=subject,
+          message=message,
+          reference_doctype="Event",
+          reference_name=event_name
+        )
+        sent_count += 1
+        
+      except Exception as e:
+        frappe.log_error(f"Failed to send invitation to {recipient.get('email')}: {str(e)}", "Event Invitation Error")
+  
+  return {
+    'sent_count': sent_count,
+    'total_selected': len([r for r in recipients if r.get('send_invitation')])
+  }
