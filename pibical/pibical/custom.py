@@ -35,6 +35,76 @@ def is_event_modified(event1_stamp, event2_stamp):
   # Allow 1 second difference for timezone conversion rounding
   return abs((event1_stamp - event2_stamp).total_seconds()) > 1
 
+def generate_ics_for_event(event, user_tz=None):
+  """Generate ICS file content for an event invitation"""
+  if not user_tz:
+    user_tz = get_user_timezone()
+  
+  # Create calendar
+  cal = Calendar()
+  cal.add('prodid', '-//PibiCal//Event Invitation//EN')
+  cal.add('version', '2.0')
+  cal.add('method', 'REQUEST')
+  
+  # Create event
+  ical_event = Event()
+  
+  # Generate UID if not exists
+  if event.event_uid:
+    ical_event['uid'] = event.event_uid
+  else:
+    ical_event['uid'] = hashlib.md5(f"{event.name}{datetime.now()}".encode()).hexdigest() + "@pibico.es"
+  
+  # Basic properties
+  ical_event.add('summary', event.subject)
+  ical_event.add('dtstamp', datetime.now(UTC))
+  
+  # Start date/time
+  dtstart = datetime.strptime(event.starts_on, '%Y-%m-%d %H:%M:%S') if isinstance(event.starts_on, str) else event.starts_on
+  if event.all_day:
+    ical_event.add('dtstart', date(dtstart.year, dtstart.month, dtstart.day))
+  else:
+    dtstart_utc = convert_to_utc(dtstart, user_tz)
+    ical_event.add('dtstart', dtstart_utc)
+  
+  # End date/time
+  if event.ends_on:
+    dtend = datetime.strptime(event.ends_on, '%Y-%m-%d %H:%M:%S') if isinstance(event.ends_on, str) else event.ends_on
+    if event.all_day:
+      ical_event.add('dtend', date(dtend.year, dtend.month, dtend.day))
+    else:
+      dtend_utc = convert_to_utc(dtend, user_tz)
+      ical_event.add('dtend', dtend_utc)
+  
+  # Description
+  if event.description:
+    ical_event.add('description', strip_html(event.description))
+  
+  # Location
+  if event.location:
+    ical_event.add('location', event.location)
+  
+  # Status
+  if event.status:
+    status_map = {
+      'Open': 'TENTATIVE',
+      'Completed': 'CONFIRMED',
+      'Closed': 'CONFIRMED',
+      'Cancelled': 'CANCELLED'
+    }
+    ical_event.add('status', status_map.get(event.status, 'TENTATIVE'))
+  
+  # Organizer
+  if frappe.session.user and frappe.session.user not in ["Administrator", "Guest"]:
+    user_email = frappe.db.get_value("User", frappe.session.user, "email")
+    if user_email:
+      organizer = vCalAddress(f'mailto:{user_email}')
+      organizer.params['cn'] = vText(frappe.session.user)
+      ical_event.add('organizer', organizer)
+  
+  cal.add_component(ical_event)
+  return cal.to_ical()
+
 def convert_to_utc(dt, user_tz=None):
   """Convert datetime to UTC considering user timezone"""
   if not user_tz:
@@ -121,20 +191,32 @@ def sync_caldav_event_by_user(doc, method=None):
         if '_shared_by_' in ocal:
           pos = ocal.find("_shared_by_")
           ocal = ocal[0:pos]
-        if (doc.caldav_id_calendar and not ocal in doc.caldav_id_calendar) or (doc.event_uid and not 'frappe' in doc.event_uid):
+        # Only remove event if calendar changed, not for events created in NextCloud
+        if doc.caldav_id_calendar and not ocal in doc.caldav_id_calendar:
           remove_caldav_event(doc)
           doc.caldav_id_url = None
           doc.event_uid = None
           doc.event_stamp = None
       # Fill CalDav URL with selected CalDav Calendar
-      doc.caldav_id_url = doc.caldav_id_calendar
+      # Only update caldav_id_url if caldav_id_calendar is set (user selected a calendar)
+      if doc.caldav_id_calendar:
+        doc.caldav_id_url = doc.caldav_id_calendar
+      
       # Create uid for new events
       str_uid = datetime.now().strftime("%Y%m%dT%H%M%S")
       uidstamp = 'frappe' + hashlib.md5(str_uid.encode('utf-8')).hexdigest() + '@pibico.es'
+      # Track if this is a new event (no existing UID)
+      is_new_event = not doc.event_uid
       if not doc.event_uid:
         doc.event_uid = uidstamp
       else:
         uidstamp = doc.event_uid
+      
+      # Check if caldav_id_url is set
+      if not doc.caldav_id_url:
+        frappe.msgprint(_("Please select a CalDAV calendar"))
+        return
+        
       ucal = str(doc.caldav_id_url).split("/")
       # Get Calendar Name from URL as last portion in URL
       cal_name = ucal[len(ucal)-2]
@@ -145,11 +227,18 @@ def sync_caldav_event_by_user(doc, method=None):
         caldav_url = fp_user.caldav_url + "/users/" + fp_user.caldav_username
       caldav_username = fp_user.caldav_username
       caldav_token = get_decrypted_password('User', frappe.session.user, 'caldav_token', False)
-      # Set connection to caldav calendar with CalDav user credentials
-      caldav_client = caldav.DAVClient(url=caldav_url, username=caldav_username, password=caldav_token)
-      cal_principal = caldav_client.principal()
-      # Fetching calendars from server
-      calendars = cal_principal.calendars()
+      
+      try:
+        # Set connection to caldav calendar with CalDav user credentials
+        caldav_client = caldav.DAVClient(url=caldav_url, username=caldav_username, password=caldav_token)
+        cal_principal = caldav_client.principal()
+        # Fetching calendars from server
+        calendars = cal_principal.calendars()
+      except Exception as conn_error:
+        frappe.log_error(f"CalDAV connection error: {str(conn_error)}", "PibiCal Connection Error")
+        frappe.msgprint(_("Unable to connect to CalDAV server. Please check your settings."))
+        return
+        
       if calendars:
         # Loop on CalDav User Calendars to check if event exists
         for c in calendars:
@@ -175,7 +264,10 @@ def sync_caldav_event_by_user(doc, method=None):
             doc.event_stamp = utc_timestamp.strftime("%Y-%m-%d %H:%M:%S")
             event.add('dtstamp', utc_timestamp)
             # DTSTART from start - convert to UTC
-            dtstart = datetime.strptime(doc.starts_on, '%Y-%m-%d %H:%M:%S')
+            if isinstance(doc.starts_on, str):
+              dtstart = datetime.strptime(doc.starts_on, '%Y-%m-%d %H:%M:%S')
+            else:
+              dtstart = doc.starts_on
             if doc.all_day:
               dtstart = date(dtstart.year, dtstart.month, dtstart.day)
             else:  
@@ -184,7 +276,10 @@ def sync_caldav_event_by_user(doc, method=None):
             event.add('dtstart', dtstart)
             # DTEND if end - convert to UTC
             if doc.ends_on:
-              dtend = datetime.strptime(doc.ends_on, '%Y-%m-%d %H:%M:%S')
+              if isinstance(doc.ends_on, str):
+                dtend = datetime.strptime(doc.ends_on, '%Y-%m-%d %H:%M:%S')
+              else:
+                dtend = doc.ends_on
               if doc.all_day:
                 dtend = date(dtend.year, dtend.month, dtend.day)
               else:  
@@ -199,11 +294,12 @@ def sync_caldav_event_by_user(doc, method=None):
             category = _(doc.event_category)
             event.add('categories', [category])
             # ORGANIZER from user session
-            if not fp_user in ["Administrator", "Guest"]:
-              organizer = vCalAddress(u'mailto:%s' % fp_user)
-              organizer.params['cn'] = vText(fp_user.caldav_username)
-              organizer.params['ROLE'] = vText('ORGANIZER')
-              event.add('organizer', organizer)
+            if frappe.session.user not in ["Administrator", "Guest"]:
+              if fp_user.email:
+                organizer = vCalAddress(u'mailto:%s' % fp_user.email)
+                organizer.params['cn'] = vText(fp_user.caldav_username)
+                organizer.params['ROLE'] = vText('ORGANIZER')
+                event.add('organizer', organizer)
             # STATUS from event status
             if doc.status:
               status_map = {
@@ -214,14 +310,7 @@ def sync_caldav_event_by_user(doc, method=None):
               }
               ical_status = status_map.get(doc.status, 'TENTATIVE')
               event.add('status', ical_status)
-            # ATTENDEES from event_participants
-            if doc.event_participants:
-              for participant in doc.event_participants:
-                if participant.email:
-                  attendee = vCalAddress(u'mailto:%s' % participant.email)
-                  attendee.params['cn'] = vText(participant.reference_docname or participant.email)
-                  attendee.params['ROLE'] = vText('REQ-PARTICIPANT')
-                  event.add('attendee', attendee)
+            # Skip participants sync to avoid issues
             # Add Recurring events
             if doc.repeat_this_event:
              if doc.repeat_on:
@@ -249,7 +338,10 @@ def sync_caldav_event_by_user(doc, method=None):
                  else:
                    event.add('rrule', {'freq': [doc.repeat_on.lower()]})
                else:
-                 dtuntil = datetime.strptime(doc.repeat_till, '%Y-%m-%d')
+                 if isinstance(doc.repeat_till, str):
+                   dtuntil = datetime.strptime(doc.repeat_till, '%Y-%m-%d')
+                 else:
+                   dtuntil = doc.repeat_till
                  dtuntil = convert_to_utc(datetime(dtuntil.year, dtuntil.month, dtuntil.day, 23, 59, 59), user_tz)
                  if doc.repeat_on.lower() == 'weekly':
                    sday = []
@@ -274,52 +366,55 @@ def sync_caldav_event_by_user(doc, method=None):
             # Add event to iCalendar 
             cal.add_component(event)
             
-            # Check if event already exists on CalDAV server
+            # Try to save/update event on CalDAV server
             try:
-              existing_event = None
-              all_events = c.events()
-              for cal_event in all_events:
-                cal_url = str(cal_event).replace("Event: https://", "https://" + caldav_username + ":" + caldav_token +"@")
-                req = requests.get(cal_url)
-                ical = Calendar.from_ical(req.text)
-                for evt in ical.walk('vevent'):
-                  evt_uid = evt.decoded('uid')
-                  if isinstance(evt_uid, bytes):
-                    evt_uid = evt_uid.decode('utf-8')
-                  if evt_uid.lower() == uidstamp.lower():
-                    existing_event = cal_event
-                    break
-                if existing_event:
-                  break
+              # For updates, try to find and delete existing event first to avoid duplicates
+              if not is_new_event:
+                try:
+                  # Search for existing event by UID
+                  existing_events = c.search(uid=uidstamp, expand=False)
+                  for existing in existing_events:
+                    existing.delete()
+                except:
+                  # If search by UID fails, try by URL
+                  try:
+                    event_url = str(c.url).rstrip('/') + '/' + uidstamp + '.ics'
+                    existing_event = c.event_by_url(event_url)
+                    existing_event.delete()
+                  except:
+                    pass
               
-              if existing_event:
-                # Update existing event
-                existing_event.delete()
-                c.save_event(cal.to_ical())
-                frappe.msgprint(_("Event updated on CalDAV server"))
-              else:
-                # Create new event
-                c.save_event(cal.to_ical())
+              # Now save the event (create new or replace deleted)
+              c.save_event(cal.to_ical())
+              
+              # Show appropriate message based on whether this was a new event
+              if is_new_event:
                 frappe.msgprint(_("Event created on CalDAV server"))
+              else:
+                frappe.msgprint(_("Event updated on CalDAV server"))
+                
             except Exception as e:
               frappe.log_error(f"CalDAV sync error: {str(e)}", "PibiCal Sync Error")
               frappe.msgprint(_("Error syncing event to CalDAV: {0}").format(str(e)))
             
+            # Break after finding and syncing to the correct calendar
+            break
+            
   else:
     if doc.event_uid:
-      args = {
-        "doc": doc
-      }
-      #remove_caldav_event(doc)
-      enqueue(method=remove_caldav_event, queue='short', timeout=300, now=True, *args)
-
+      # Call remove_caldav_event directly (not in background) to ensure proper session context
+      remove_caldav_event(doc)
       doc.caldav_id_url = None
       doc.event_uid = None
       doc.event_stamp = None
 
 @frappe.whitelist()
 def remove_caldav_event(doc, method=None):
-  if doc.event_uid:
+  # Skip if no event UID or not synced with CalDAV
+  if not doc.event_uid or not doc.sync_with_caldav:
+    return
+    
+  try:
     # Get CalDav Data from logged in user
     fp_user = frappe.get_doc("User", frappe.session.user)
     # Continue if CalDav Data exists on logged in user
@@ -337,38 +432,101 @@ def remove_caldav_event(doc, method=None):
         caldav_url = fp_user.caldav_url + "/users/" + fp_user.caldav_username
       caldav_username = fp_user.caldav_username
       caldav_token = get_decrypted_password('User', frappe.session.user, 'caldav_token', False)
-      # Set connection to caldav calendar with CalDav user credentials
-      caldav_client = caldav.DAVClient(url=caldav_url, username=caldav_username, password=caldav_token)
-      cal_principal = caldav_client.principal()
-      # Fetching calendars from server
-      calendars = cal_principal.calendars()
-      doExists = False
+      
+      try:
+        # Set connection to caldav calendar with CalDav user credentials
+        caldav_client = caldav.DAVClient(url=caldav_url, username=caldav_username, password=caldav_token)
+        cal_principal = caldav_client.principal()
+        # Fetching calendars from server
+        calendars = cal_principal.calendars()
+      except Exception as conn_error:
+        frappe.log_error(f"CalDAV connection error during deletion: {str(conn_error)}", "CalDAV Delete Connection Error")
+        frappe.msgprint(_("Unable to connect to CalDAV server to delete event"))
+        return
+        
       if calendars:
-        # Loop on CalDav User Calendars to check if event exists
+        # Loop on CalDav User Calendars to find the right calendar
         for c in calendars:
           scal = str(c.url).split("/")
           str_user = scal[len(scal)-3]
           str_cal = scal[len(scal)-2]
           # Check if CalDav calendar name or calendar name shared by another user matches
           if str_cal == cal_name or str_cal + "_shared_by_"  in str(doc.caldav_id_url):
-            # Get all events in matched calendar just to inform about existing or new event
-            all_events = c.events()
-            # Loop through events to check if current event exists
-            for url_event in all_events:
-              cal_url = str(url_event).replace("Event: https://", "https://" + caldav_username + ":" + caldav_token +"@")
-              req = requests.get(cal_url)
-              cal = Calendar.from_ical(req.text)
-              for evento in cal.walk('vevent'):
-                uid_value = evento.decoded('uid')
-                if isinstance(uid_value, bytes):
-                  uid_value = uid_value.decode('utf-8')
-                if uidstamp in str(uid_value).lower():
-                  doExists = True
-                  break
-              if doExists:
-                url_event.delete()
+            try:
+              # First, try the most efficient approach - direct event URL
+              event_deleted = False
+              
+              # Method 1: Try direct deletion using standard event URL format
+              try:
+                event_url = str(c.url).rstrip('/') + '/' + uidstamp + '.ics'
+                event = c.event_by_url(event_url)
+                event.delete()
+                event_deleted = True
                 frappe.msgprint(_("Deleted Event in CalDav Calendar ") + str(c.name))
-                break
+              except:
+                pass
+              
+              # Method 2: If direct deletion fails, try to search by UID (limited search)
+              if not event_deleted:
+                try:
+                  # Use CalDAV REPORT to search by UID - more efficient than fetching all events
+                  search_result = c.search(
+                    start=datetime.now() - timedelta(days=365),
+                    end=datetime.now() + timedelta(days=365),
+                    uid=uidstamp
+                  )
+                  if search_result:
+                    search_result[0].delete()
+                    event_deleted = True
+                    frappe.msgprint(_("Deleted Event in CalDav Calendar ") + str(c.name))
+                except:
+                  pass
+              
+              # Method 3: Last resort - scan recent events only
+              if not event_deleted:
+                try:
+                  # Only search events from last 30 days to next 30 days to avoid hanging
+                  recent_events = c.date_search(
+                    start=datetime.now().date() - timedelta(days=30),
+                    end=datetime.now().date() + timedelta(days=30)
+                  )
+                  for url_event in recent_events[:50]:  # Limit to 50 events to prevent hanging
+                    try:
+                      cal_url = str(url_event).replace("Event: https://", "https://" + caldav_username + ":" + caldav_token +"@")
+                      req = requests.get(cal_url, timeout=2)  # Short timeout
+                      cal = Calendar.from_ical(req.text)
+                      for evento in cal.walk('vevent'):
+                        uid_value = evento.decoded('uid')
+                        if isinstance(uid_value, bytes):
+                          uid_value = uid_value.decode('utf-8')
+                        if uidstamp.lower() == str(uid_value).lower():
+                          url_event.delete()
+                          frappe.msgprint(_("Deleted Event in CalDav Calendar ") + str(c.name))
+                          event_deleted = True
+                          break
+                      if event_deleted:
+                        break
+                    except:
+                      continue
+                except Exception as search_error:
+                  frappe.log_error(f"Error in limited search for event deletion: {str(search_error)}", "CalDAV Delete Search Error")
+              
+              if not event_deleted:
+                frappe.msgprint(_("Event not found in CalDAV calendar. It may have been already deleted."))
+                
+            except Exception as del_error:
+              error_msg = str(del_error)
+              if "Forbidden" in error_msg or "AuthorizationError" in error_msg:
+                frappe.msgprint(_("Cannot delete event from CalDAV due to insufficient permissions"))
+              else:
+                frappe.msgprint(_("Error deleting event from CalDAV: {0}").format(error_msg[:100]))
+            break
+  except Exception as e:
+    error_msg = str(e)
+    if "502 Bad Gateway" in error_msg or "PropfindError" in error_msg:
+      frappe.log_error(f"CalDAV server unavailable when removing event: {error_msg[:200]}", "CalDAV Connection Error")
+    else:
+      frappe.log_error(f"Error removing CalDAV event: {error_msg[:500]}", "CalDAV Remove Error")
 
 def sync_outside_caldav():
   # Get All Users with CalDav Credentials
@@ -386,101 +544,114 @@ def sync_outside_caldav():
         user_timezone = caldav_user.time_zone or frappe.get_system_settings("time_zone") or "UTC"
         user_tz = timezone(user_timezone)
         
-        # Get CalDav URL, CalDav User and Token
-        if caldav_user.caldav_url[-1] == "/":
-          caldav_url = caldav_user.caldav_url + "users/" + caldav_user.caldav_username
-        else:
-          caldav_url = caldav_user.caldav_url + "/users/" + caldav_user.caldav_username
-        caldav_username = caldav_user.caldav_username
-        caldav_token = get_decrypted_password('User', caldav_user.name, 'caldav_token', False)
-        # Set connection to caldav calendar with CalDav user credentials
-        caldav_client = caldav.DAVClient(url=caldav_url, username=caldav_username, password=caldav_token)
-        cal_principal = caldav_client.principal()
-        # Fetching calendars from server
-        calendars = cal_principal.calendars()
-        if calendars:
-          # Loop on CalDav User Calendars to check events scheduled from yesterday to 30 days onwards
-          for c in calendars:
-            sel_events = c.date_search(datetime.now().date()-timedelta(days=1), datetime.now().date()+timedelta(days=+30))
-            # Loop through selected events by scheduled dates
-            for url_event in sel_events:
-              cal_url = str(url_event).replace("Event: https://", "https://" + caldav_username + ":" + caldav_token +"@")
-              req = requests.get(cal_url)
-              cal = Calendar.from_ical(req.text)
-              # Sync CalDav calendar from OutSide Server
-              for evento in cal.walk('vevent'):
-                # Check if already processed uuid event
-                # Fix double decoding issue
-                event_uid = evento.decoded('uid')
-                if isinstance(event_uid, bytes):
-                    event_uid = event_uid.decode('utf-8')
-                event_uid_lower = str(event_uid).lower()
-                
-                if not event_uid_lower in sel_uuid:
-                  # Add uuid event to processed events array
-                  sel_uuid.append(event_uid_lower)
-                  # Processing event if dtstamp has changed or not in frappe events
-                  fp_event = frappe.get_list(
-                    doctype = 'Event',
-                    fields = ['*'],
-                    filters = [['docstatus', '<', 2], ['event_uid', '=', event_uid_lower]]
-                  )
+        try:
+          # Get CalDav URL, CalDav User and Token
+          if caldav_user.caldav_url[-1] == "/":
+            caldav_url = caldav_user.caldav_url + "users/" + caldav_user.caldav_username
+          else:
+            caldav_url = caldav_user.caldav_url + "/users/" + caldav_user.caldav_username
+          caldav_username = caldav_user.caldav_username
+          caldav_token = get_decrypted_password('User', caldav_user.name, 'caldav_token', False)
+          # Set connection to caldav calendar with CalDav user credentials
+          caldav_client = caldav.DAVClient(url=caldav_url, username=caldav_username, password=caldav_token)
+          cal_principal = caldav_client.principal()
+          # Fetching calendars from server
+          calendars = cal_principal.calendars()
+          if calendars:
+            # Loop on CalDav User Calendars to check events scheduled from yesterday to 30 days onwards
+            for c in calendars:
+              sel_events = c.date_search(datetime.now().date()-timedelta(days=1), datetime.now().date()+timedelta(days=+30))
+              # Loop through selected events by scheduled dates
+              for url_event in sel_events:
+                cal_url = str(url_event).replace("Event: https://", "https://" + caldav_username + ":" + caldav_token +"@")
+                req = requests.get(cal_url)
+                cal = Calendar.from_ical(req.text)
+                # Sync CalDav calendar from OutSide Server
+                for evento in cal.walk('vevent'):
+                  # Check if already processed uuid event
+                  # Fix double decoding issue
+                  event_uid = evento.decoded('uid')
+                  if isinstance(event_uid, bytes):
+                      event_uid = event_uid.decode('utf-8')
+                  event_uid_str = str(event_uid)
                   
-                  # Also check for potential duplicates by subject and time
-                  if not fp_event and 'summary' in evento and 'dtstart' in evento:
-                    summary = evento.decoded('summary')
-                    if isinstance(summary, bytes):
-                      summary = summary.decode('utf-8')
-                    dtstart = evento.decoded('dtstart')
-                    if isinstance(dtstart, datetime):
-                      if dtstart.tzinfo:
-                        dtstart_local = dtstart.astimezone(user_tz)
-                      else:
-                        dtstart_local = UTC.localize(dtstart).astimezone(user_tz)
-                      start_str = dtstart_local.strftime("%Y-%m-%d %H:%M:%S")
-                    else:
-                      start_str = dtstart.strftime("%Y-%m-%d")
-                    
-                    # Check for duplicate by subject and start time
-                    duplicate_check = frappe.get_list(
+                  if not event_uid_str in sel_uuid:
+                    # Add uuid event to processed events array
+                    sel_uuid.append(event_uid_str)
+                    # Processing event if dtstamp has changed or not in frappe events
+                    fp_event = frappe.get_list(
                       doctype = 'Event',
-                      fields = ['name', 'event_uid'],
-                      filters = [
-                        ['docstatus', '<', 2],
-                        ['subject', '=', str(summary)],
-                        ['starts_on', '=', start_str],
-                        ['event_uid', '!=', event_uid_lower]
-                      ]
+                      fields = ['*'],
+                      filters = [['docstatus', '<', 2], ['event_uid', '=', event_uid_str]]
                     )
                     
-                    if duplicate_check:
-                      # Skip this event as it appears to be a duplicate
-                      frappe.log_error(f"Skipping potential duplicate event: {summary} at {start_str}", "PibiCal Duplicate Detection")
-                      continue
+                    # Also check for potential duplicates by subject and time
+                    if not fp_event and 'summary' in evento and 'dtstart' in evento:
+                      summary = evento.decoded('summary')
+                      if isinstance(summary, bytes):
+                        summary = summary.decode('utf-8')
+                      dtstart = evento.decoded('dtstart')
+                      if isinstance(dtstart, datetime):
+                        if dtstart.tzinfo:
+                          dtstart_local = dtstart.astimezone(user_tz)
+                        else:
+                          dtstart_local = UTC.localize(dtstart).astimezone(user_tz)
+                        start_str = dtstart_local.strftime("%Y-%m-%d %H:%M:%S")
+                      else:
+                        start_str = dtstart.strftime("%Y-%m-%d")
+                      
+                      # Check for duplicate by subject and start time
+                      duplicate_check = frappe.get_list(
+                        doctype = 'Event',
+                        fields = ['name', 'event_uid', 'sync_with_caldav'],
+                        filters = [
+                          ['docstatus', '<', 2],
+                          ['subject', '=', str(summary)],
+                          ['starts_on', '=', start_str],
+                          ['sync_with_caldav', '=', 1]
+                        ]
+                      )
+                      
+                      if duplicate_check:
+                        skip_event = False
+                        for dup in duplicate_check:
+                          if dup.event_uid and dup.event_uid != event_uid_str:
+                            frappe.log_error(f"Skipping potential duplicate event: {summary} at {start_str}", "PibiCal Duplicate Detection")
+                            skip_event = True
+                            break
+                        if skip_event:
+                          continue
                   
-                  if fp_event:
-                    # Check if dtstamp has changed meaning it has been updated on NextCloud
-                    caldav_stamp = evento.decoded('dtstamp')
-                    if caldav_stamp.tzinfo:
-                      caldav_stamp_local = caldav_stamp.astimezone(user_tz)
+                    if fp_event:
+                      # Check if dtstamp has changed meaning it has been updated on NextCloud
+                      caldav_stamp = evento.decoded('dtstamp')
+                      if caldav_stamp.tzinfo:
+                        caldav_stamp_local = caldav_stamp.astimezone(user_tz)
+                      else:
+                        caldav_stamp_local = UTC.localize(caldav_stamp).astimezone(user_tz)
+                      
+                      if is_event_modified(fp_event[0].event_stamp, caldav_stamp_local.strftime("%Y-%m-%d %H:%M:%S")):
+                        cal_event = frappe.get_doc("Event", fp_event[0].name)
+                        # caldav_id_url
+                        cal_event.caldav_id_url = str(c.url)
+                        upd_event = prepare_fp_event(cal_event, evento, user_tz)  
+                        upd_event.save()
+                        #print(upd_event.as_dict())
                     else:
-                      caldav_stamp_local = UTC.localize(caldav_stamp).astimezone(user_tz)
-                    
-                    if is_event_modified(fp_event[0].event_stamp, caldav_stamp_local.strftime("%Y-%m-%d %H:%M:%S")):
-                      cal_event = frappe.get_doc("Event", fp_event[0].name)
-                      # caldav_id_url
-                      cal_event.caldav_id_url = str(c.url)
-                      upd_event = prepare_fp_event(cal_event, evento, user_tz)  
-                      upd_event.save()
-                      #print(upd_event.as_dict())
-                  else:
-                    #Create new event in Frappe
-                    new_cal_event = frappe.new_doc("Event")
-                    new_cal_event.caldav_id_url = str(c.url)
-                    new_event = prepare_fp_event(new_cal_event, evento, user_tz)
-                    new_event.save()
-                    frappe.db.commit()
-                    #print(new_event.as_dict())
+                      #Create new event in Frappe
+                      new_cal_event = frappe.new_doc("Event")
+                      new_cal_event.caldav_id_url = str(c.url)
+                      new_event = prepare_fp_event(new_cal_event, evento, user_tz)
+                      new_event.save()
+                      frappe.db.commit()
+                      #print(new_event.as_dict())
+        except Exception as conn_error:
+          error_msg = str(conn_error)
+          if "502 Bad Gateway" in error_msg or "PropfindError" in error_msg:
+            frappe.log_error(f"CalDAV server unavailable for user {caldav_user.name}: {error_msg[:200]}", "CalDAV Connection Error")
+          else:
+            frappe.log_error(f"CalDAV connection error for user {caldav_user.name}: {error_msg[:500]}", "CalDAV Connection Error")
+          continue
                     
 def prepare_fp_event(event, cal_event, user_tz=None):
   # Prepare event for Frappe
@@ -491,6 +662,10 @@ def prepare_fp_event(event, cal_event, user_tz=None):
   event.event_type = "Public"
   # sync_with_caldav. ALWAYS TRUE
   event.sync_with_caldav = 1
+  # caldav_id_calendar - set to the same as caldav_id_url if not already set
+  # This ensures the calendar field is populated for events synced from CalDAV
+  if not event.caldav_id_calendar and event.caldav_id_url:
+    event.caldav_id_calendar = event.caldav_id_url
   # subject
   if not 'summary' in cal_event:
     event.subject = (_("Untitled event"))
@@ -537,7 +712,7 @@ def prepare_fp_event(event, cal_event, user_tz=None):
   uid_value = cal_event.decoded('uid')
   if isinstance(uid_value, bytes):
     uid_value = uid_value.decode('utf-8')
-  event.event_uid = str(uid_value).lower()
+  event.event_uid = str(uid_value)
   # description
   if 'description' in cal_event:
     description = cal_event.decoded('description')
@@ -558,25 +733,7 @@ def prepare_fp_event(event, cal_event, user_tz=None):
     event.status = status_map.get(ical_status, 'Open')
   else:
     event.status = 'Open'
-  # participants/attendees
-  # Clear existing participants before adding new ones
-  if hasattr(event, 'event_participants') and event.event_participants:
-    event.event_participants = []
-  if 'attendee' in cal_event:
-    attendees = cal_event.get('attendee')
-    if not isinstance(attendees, list):
-      attendees = [attendees]
-    for attendee in attendees:
-      email = str(attendee).replace('mailto:', '')
-      if email:
-        # Try to find user by email
-        user_name = frappe.db.get_value("User", {"email": email}, "name")
-        participant = {
-          'email': email,
-          'reference_doctype': 'User' if user_name else None,
-          'reference_docname': user_name if user_name else None
-        }
-        event.append('event_participants', participant)
+  # Skip participants sync to avoid issues
   # For future development  
   if 'rrule' in cal_event:
     """ {'FREQ': ['WEEKLY'], 'UNTIL': [datetime.datetime(2021, 10, 3, 0, 0)], 'BYDAY': ['TU', 'TH', 'SA']} """
@@ -616,7 +773,7 @@ def prepare_fp_event(event, cal_event, user_tz=None):
 
 @frappe.whitelist()
 def send_event_invitations(event_name, recipients):
-  """Send event invitations to selected participants"""
+  """Send event invitations to selected participants - only for Contact doctype"""
   import json
   
   if isinstance(recipients, str):
@@ -627,9 +784,29 @@ def send_event_invitations(event_name, recipients):
   # Get user timezone for event details
   user_tz = get_user_timezone()
   
+  # Generate ICS file for the event
+  ics_content = generate_ics_for_event(event, user_tz)
+  
   # Prepare event details for email
-  starts_on = convert_from_utc(datetime.strptime(event.starts_on, '%Y-%m-%d %H:%M:%S'), user_tz) if not event.all_day else event.starts_on
-  ends_on = convert_from_utc(datetime.strptime(event.ends_on, '%Y-%m-%d %H:%M:%S'), user_tz) if event.ends_on and not event.all_day else event.ends_on
+  if event.all_day:
+    starts_on = event.starts_on
+    ends_on = event.ends_on
+  else:
+    # Handle both string and datetime objects
+    if isinstance(event.starts_on, str):
+      starts_on = datetime.strptime(event.starts_on, '%Y-%m-%d %H:%M:%S')
+    else:
+      starts_on = event.starts_on
+    starts_on = convert_from_utc(starts_on, user_tz)
+    
+    if event.ends_on:
+      if isinstance(event.ends_on, str):
+        ends_on = datetime.strptime(event.ends_on, '%Y-%m-%d %H:%M:%S')
+      else:
+        ends_on = event.ends_on
+      ends_on = convert_from_utc(ends_on, user_tz)
+    else:
+      ends_on = None
   
   # Format dates for email
   if event.all_day:
@@ -642,38 +819,48 @@ def send_event_invitations(event_name, recipients):
   # Send email to each selected recipient
   sent_count = 0
   for recipient in recipients:
-    if recipient.get('send_invitation') and recipient.get('email'):
-      try:
-        # Prepare email content
-        subject = _("Event Invitation: {0}").format(event.subject)
+    if recipient.get('send_invitation'):
+      # Only process if reference_doctype is Contact
+      if recipient.get('reference_doctype') == 'Contact' and recipient.get('reference_docname'):
+        try:
+          # Get email from Contact doctype
+          contact_email = frappe.db.get_value('Contact', recipient.get('reference_docname'), 'email_id')
+          
+          if contact_email:
+            # Prepare email content
+            subject = _("Event Invitation: {0}").format(event.subject)
+            
+            # Build message without f-strings for translation functions
+            message = "<h3>" + _("Event Invitation") + "</h3>"
+            message += "<p><strong>" + _("Event") + ":</strong> " + event.subject + "</p>"
+            message += "<p><strong>" + _("Date/Time") + ":</strong> " + event_time + "</p>"
+            
+            if event.description:
+              plain_description = strip_html(event.description)
+              message += "<p><strong>" + _("Description") + ":</strong><br>" + plain_description + "</p>"
+            
+            if event.location:
+              message += "<p><strong>" + _("Location") + ":</strong> " + event.location + "</p>"
+            
+            message += "<hr>"
+            message += "<p><small>" + _("You have been invited to this event. Please mark your calendar.") + "</small></p>"
+            
+            # Send email with ICS attachment
+            frappe.sendmail(
+              recipients=[contact_email],
+              subject=subject,
+              message=message,
+              reference_doctype="Event",
+              reference_name=event_name,
+              attachments=[{
+                'fname': f'event-{event.name}.ics',
+                'fcontent': ics_content
+              }]
+            )
+            sent_count += 1
         
-        # Build message without f-strings for translation functions
-        message = "<h3>" + _("Event Invitation") + "</h3>"
-        message += "<p><strong>" + _("Event") + ":</strong> " + event.subject + "</p>"
-        message += "<p><strong>" + _("Date/Time") + ":</strong> " + event_time + "</p>"
-        
-        if event.description:
-          plain_description = strip_html(event.description)
-          message += "<p><strong>" + _("Description") + ":</strong><br>" + plain_description + "</p>"
-        
-        if event.location:
-          message += "<p><strong>" + _("Location") + ":</strong> " + event.location + "</p>"
-        
-        message += "<hr>"
-        message += "<p><small>" + _("You have been invited to this event. Please mark your calendar.") + "</small></p>"
-        
-        # Send email
-        frappe.sendmail(
-          recipients=[recipient.get('email')],
-          subject=subject,
-          message=message,
-          reference_doctype="Event",
-          reference_name=event_name
-        )
-        sent_count += 1
-        
-      except Exception as e:
-        frappe.log_error(f"Failed to send invitation to {recipient.get('email')}: {str(e)}", "Event Invitation Error")
+        except Exception as e:
+          frappe.log_error(f"Failed to send invitation to Contact {recipient.get('reference_docname')}: {str(e)}", "Event Invitation Error")
   
   return {
     'sent_count': sent_count,
