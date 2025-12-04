@@ -4,3 +4,5 @@
 *.swp
 tags
 pibical/docs/current
+CLAUDE.md
+.claude/
